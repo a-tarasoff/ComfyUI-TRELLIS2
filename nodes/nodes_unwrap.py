@@ -493,6 +493,7 @@ Parameters:
 - texture_size: Resolution of baked textures (512-16384px)""",
             inputs=[
                 io.Custom("TRIMESH").Input("trimesh"),
+                io.Custom("TRIMESH").Input("source_trimesh"),
                 io.Custom("TRELLIS2_VOXELGRID").Input("voxelgrid"),
                 io.Int.Input("texture_size", default=2048, min=512, max=16384, step=512),
             ],
@@ -505,6 +506,7 @@ Parameters:
     def execute(
         cls,
         trimesh,
+        source_trimesh,
         voxelgrid,
         texture_size=2048,
     ):
@@ -536,6 +538,15 @@ Parameters:
         # Undo Z-up to Y-up for voxel sampling
         vertices_yup = vertices.clone()
         vertices_yup[:, 1], vertices_yup[:, 2] = vertices[:, 2].clone(), -vertices[:, 1].clone()
+
+        source_vertices = torch.tensor(source_trimesh.vertices, dtype=torch.float32).to(device)
+        source_faces = torch.tensor(source_trimesh.faces, dtype=torch.int32).to(device)
+        source_vertices_yup = source_vertices.clone()
+        source_vertices_yup[:, 1], source_vertices_yup[:, 2] = (
+            source_vertices[:, 2].clone(),
+            -source_vertices[:, 1].clone(),
+        )
+        source_bvh = CuMesh.cuBVH(source_vertices_yup, source_faces)
 
         # Get voxel data from dict
         attr_volume = voxelgrid['attrs']
@@ -572,6 +583,12 @@ Parameters:
         del vertices_yup
         comfy.model_management.soft_empty_cache()
 
+        logger.info("Mapping rasterized samples to original surface...")
+        _, face_id, uvw = _batched_unsigned_distance(source_bvh, valid_pos, return_uvw=True)
+        source_tri_verts = source_vertices_yup[source_faces[face_id.long()].long()]
+        valid_pos = (source_tri_verts * uvw.unsqueeze(-1)).sum(dim=1)
+        del face_id, uvw, source_tri_verts
+
         # Sample voxel attributes for texture pixels
         logger.info("Sampling voxel attributes...")
         attrs = torch.zeros(texture_size, texture_size, attr_volume.shape[1], device=device)
@@ -587,17 +604,21 @@ Parameters:
         logger.info("Sampling vertex PBR attributes...")
         verts_yup = vertices.clone()
         verts_yup[:, 1], verts_yup[:, 2] = vertices[:, 2].clone(), -vertices[:, 1].clone()
+        _, vertex_face_id, vertex_uvw = _batched_unsigned_distance(source_bvh, verts_yup, return_uvw=True)
+        vertex_tri_verts = source_vertices_yup[source_faces[vertex_face_id.long()].long()]
+        vertex_sample_pos = (vertex_tri_verts * vertex_uvw.unsqueeze(-1)).sum(dim=1)
         vertex_pbr_attrs = grid_sample_3d(
             attr_volume,
             torch.cat([torch.zeros_like(coords[:, :1]), coords], dim=-1),
             shape=torch.Size([1, attr_volume.shape[1], *grid_size.tolist()]),
-            grid=((verts_yup - aabb[0]) / voxel_size).reshape(1, -1, 3),
+            grid=((vertex_sample_pos - aabb[0]) / voxel_size).reshape(1, -1, 3),
             mode='trilinear',
         )[0]
+        del vertex_face_id, vertex_uvw, vertex_tri_verts, vertex_sample_pos
 
         logger.info("Building PBR textures...")
 
-        del valid_pos, attr_volume, coords, verts_yup
+        del valid_pos, attr_volume, coords, verts_yup, source_bvh, source_vertices_yup, source_faces, source_vertices
         comfy.model_management.soft_empty_cache()
 
         mask_np = mask.cpu().numpy()
